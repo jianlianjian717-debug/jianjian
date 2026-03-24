@@ -294,6 +294,7 @@ def export_batch_query_rows(rows: list[dict], save_path: str) -> None:
         "risk_confidence",
         "risk_severity",
         "exist_risk",
+        "asr_text",
         "error",
     ]
     with open(save_path, "w", encoding="utf-8-sig", newline="") as f:
@@ -395,6 +396,7 @@ class BatchQueryWorker(QObject):
                     "risk_confidence": "",
                     "risk_severity": "",
                     "exist_risk": "",
+                    "asr_text": "",
                     "error": "",
                 }
                 if not session_id:
@@ -408,6 +410,7 @@ class BatchQueryWorker(QObject):
                     row["risk_confidence"] = result.get("risk_confidence", "")
                     row["risk_severity"] = result.get("risk_severity", "")
                     row["exist_risk"] = result.get("exist_risk", "")
+                    row["asr_text"] = result.get("asr_text", "")
                 except Exception as e:
                     row["error"] = str(e)
                 rows.append(row)
@@ -447,14 +450,16 @@ class MainWindow(QWidget):
         self.mode_tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.mode_tabs)
 
-        layout.addWidget(QLabel("请输入 URL："))
+        self.url_label = QLabel("请输入 URL：")
+        layout.addWidget(self.url_label)
 
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://example.com")
         self.url_edit.returnPressed.connect(self.on_query_auto)
         layout.addWidget(self.url_edit)
 
-        layout.addWidget(QLabel("请输入 session_id："))
+        self.session_id_label = QLabel("请输入 session_id：")
+        layout.addWidget(self.session_id_label)
         self.session_id_edit = QLineEdit()
         self.session_id_edit.setPlaceholderText("请输入接口返回的 session_id")
         self.session_id_edit.returnPressed.connect(self.on_query_auto)
@@ -534,7 +539,9 @@ class MainWindow(QWidget):
         is_single_mode = index == 0
         is_file_mode = not is_single_mode
 
+        self.url_label.setVisible(is_single_mode)
         self.url_edit.setVisible(is_single_mode)
+        self.session_id_label.setVisible(is_single_mode)
         self.session_id_edit.setVisible(is_single_mode)
 
         self.detect_section_label.setVisible(is_file_mode)
@@ -696,7 +703,8 @@ class MainWindow(QWidget):
             f"reason: {result.get('reason', '')}\n"
             f"risk_confidence: {result.get('risk_confidence', '')}\n"
             f"risk_severity: {result.get('risk_severity', '')}\n"
-            f"exist_risk: {result.get('exist_risk', '')}"
+            f"exist_risk: {result.get('exist_risk', '')}\n"
+            f"asr_text: {result.get('asr_text', '')}"
         )
         QMessageBox.information(self, "查询结果", message)
 
