@@ -22,6 +22,105 @@ from urllib.parse import urlparse
 DETECT_TELECOM_FRAUD_URL = "http://103.90.155.233:9024/detect_telecom_fraud"
 QUERY_TELECOM_FRAUD_RESULT_URL = "http://103.90.155.233:9024/query_telecom_fraud_result"
 
+# 检测接口回调地址（与接口约定一致）
+DETECT_CALLBACK_URL = (
+    "https://landcall.langma.cn/notifications/voice-quality-test-result/lm-model"
+)
+
+DETECT_INDUSTRIES = {
+    "金融业": [
+        "银行贷款",
+        "互联网贷款",
+        "信用卡",
+        "pos机（刷卡机）",
+        "保险类",
+        "投资理财",
+        "股票、证券类",
+        "其他",
+        "债务优化",
+        "互联网支付",
+        "收款码",
+    ],
+    "专业服务": ["社保/医保/政府代办", "公检法代办"],
+    "汽车": ["汽车销售", "汽车服务", "汽车配件", "汽车保险", "ETC", "其他", "饲料销售", "二手买卖"],
+    "教育培训": ["学校教育", "培训/教育辅导", "其他", "消防培训", "艺术培训", "学历提升"],
+    "广告/传媒/文化": ["广告/推广", "会议邀约/营销", "新闻/出版", "互联网推广", "文化传媒", "其他"],
+    "零售/贸易/批发": [
+        "烟酒类",
+        "服装/纺织",
+        "珠宝/首饰",
+        "家具/家居/家电",
+        "食品/饮料",
+        "玩具/礼品",
+        "零售",
+        "批发",
+        "采购",
+        "其他",
+        "生活用品",
+        "图片批发",
+        "图书",
+    ],
+    "交通运输/仓储/物流": ["快递", "货运/物流", "仓储", "其他"],
+    "生活服务": [
+        "婚纱摄影",
+        "美业",
+        "健身",
+        "婚恋/交友",
+        "机票",
+        "家政",
+        "旅游",
+        "餐饮",
+        "青少年活动中心（少年宫）",
+        "其他",
+        "回收",
+        "保健服务",
+        "酒店管理",
+        "养生",
+        "招生策划",
+        "环保业",
+        "化妆品销售",
+        "会销",
+        "婚礼策划",
+        "书籍",
+        "销售",
+        "健康咨询",
+    ],
+    "医疗保健": ["医疗检测", ">药品", "保健品", "医疗器械", "医疗美容", "其他", "医疗用品", "医疗售后回访"],
+    "互联网/通信": [
+        "电商(淘宝/抖音/苏宁/京东等)",
+        "电商代运营",
+        "软件服务",
+        "通讯业务",
+        "游戏",
+        "其他",
+        "地图服务",
+        "线上运营",
+        "服务器 计算机",
+        "云服务器销售",
+        "地图标注",
+    ],
+    "房地产/建筑": ["房地产中介/销售", "物业服务", "装饰装修", "建材", "其他", "建筑服务", "物业维修"],
+    "博彩/赌博": ["六合彩资料推销", "赌博引流(杀猪盘前兆)", "博彩预测/内幕消息"],
+    "制造业": [
+        "机械设>备",
+        "电子设备",
+        "农副产品",
+        "渔/牧/木业",
+        "家具制造",
+        "化工原料/化学制品",
+        "印刷/包装/造纸",
+        "金属制品",
+        "其他",
+        "塑料加工业",
+        "农业种植",
+        "钢材",
+        "石材",
+        "包装袋",
+        "加工",
+    ],
+    "其他": ["养老/社会保障", "环保/能源", "其他", "测试", "翡翠销售", "暂无行业", "奢侈品回收"],
+}
+
 try:
     from PySide6.QtCore import QObject, Qt, QThread, Signal
     from PySide6.QtWidgets import (
@@ -54,11 +153,18 @@ def post_detect_telecom_fraud(
 ) -> str:
     """
     调用检测接口，返回响应中的 session_id。
+    入参：audio_data_base64、audio_url、audio_codec、risk_keywords、callback_url。
+    其中 audio_codec 按当前约定固定为空字符串。
     """
-    payload = json.dumps(
-        {"audio_url": audio_url, "audio_codec": "mp3"},
-        ensure_ascii=False,
-    ).encode("utf-8")
+    body = {
+        "audio_data_base64": "",
+        "audio_url": audio_url,
+        "audio_codec": "",
+        "risk_keywords": [],
+        "industries": DETECT_INDUSTRIES,
+        "callback_url": DETECT_CALLBACK_URL,
+    }
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
     raw = ""
     for attempt in range(max_retries + 1):
         req = urllib.request.Request(
@@ -290,6 +396,7 @@ def export_batch_query_rows(rows: list[dict], save_path: str) -> None:
     fieldnames = [
         "url",
         "session_id",
+        "industry",
         "reason",
         "risk_confidence",
         "risk_severity",
@@ -392,6 +499,7 @@ class BatchQueryWorker(QObject):
                 row = {
                     "url": url,
                     "session_id": session_id,
+                    "industry": "",
                     "reason": "",
                     "risk_confidence": "",
                     "risk_severity": "",
@@ -406,6 +514,7 @@ class BatchQueryWorker(QObject):
                     continue
                 try:
                     result = post_query_telecom_fraud_result(session_id)
+                    row["industry"] = result.get("industry", "")
                     row["reason"] = result.get("reason", "")
                     row["risk_confidence"] = result.get("risk_confidence", "")
                     row["risk_severity"] = result.get("risk_severity", "")
@@ -436,6 +545,8 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("URL 工具")
         self.setMinimumWidth(480)
+        # 整体高度收紧约三分之一，减少纵向空白
+        self.setMinimumHeight(410)
 
         self._thread: Optional[QThread] = None
         self._worker: Optional[QObject] = None
@@ -700,6 +811,7 @@ class MainWindow(QWidget):
         self._set_busy(False)
         self._cleanup_thread()
         message = (
+            f"industry: {result.get('industry', '')}\n"
             f"reason: {result.get('reason', '')}\n"
             f"risk_confidence: {result.get('risk_confidence', '')}\n"
             f"risk_severity: {result.get('risk_severity', '')}\n"

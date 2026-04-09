@@ -41,6 +41,8 @@ def main() -> int:
                 "--noconfirm",
                 "--clean",
                 "--windowed",
+                "--collect-all",
+                "PySide6",
                 "--name",
                 app_name,
                 str(entry_file),
