@@ -121,6 +121,25 @@ DETECT_INDUSTRIES = {
     "其他": ["养老/社会保障", "环保/能源", "其他", "测试", "翡翠销售", "暂无行业", "奢侈品回收"],
 }
 
+# 批量查询导出列：内部字段名 -> 中文表头
+BATCH_QUERY_EXPORT_COLUMNS: list[tuple[str, str]] = [
+    ("url", "录音地址"),
+    ("session_id", "质检id"),
+    ("industry", "行业"),
+    ("industry_consistent", "话术一致性"),
+    ("reason", "原因"),
+    ("risk_confidence", "诈骗系数"),
+    ("risk_severity", "诈骗危害程度"),
+    ("exist_risk", "是否诈骗"),
+    ("asr_text", "通话内容"),
+    ("agent_attitude", "客服态度"),
+    ("agent_attitude_score", "客服态度得分"),
+    ("agent_attitude_reason", "客服态度原因"),
+    ("user_politeness_score", "用户礼貌得分"),
+    ("user_politeness_reason", "用户礼貌评分原因"),
+    ("error", "其他"),
+]
+
 try:
     from PySide6.QtCore import QObject, Qt, QThread, Signal
     from PySide6.QtWidgets import (
@@ -149,19 +168,25 @@ except ImportError:
 
 
 def post_detect_telecom_fraud(
-    audio_url: str, timeout_sec: float = 300.0, max_retries: int = 2
+    audio_url: str,
+    text: str = "",
+    reported_industry: str = "",
+    timeout_sec: float = 300.0,
+    max_retries: int = 2,
 ) -> str:
     """
     调用检测接口，返回响应中的 session_id。
-    入参：audio_data_base64、audio_url、audio_codec、risk_keywords、callback_url。
+    入参：audio_data_base64、audio_url、audio_codec、text、risk_keywords、industries、reported_industry、callback_url。
     其中 audio_codec 按当前约定固定为空字符串。
     """
     body = {
         "audio_data_base64": "",
         "audio_url": audio_url,
         "audio_codec": "",
+        "text": text,
         "risk_keywords": [],
         "industries": DETECT_INDUSTRIES,
+        "reported_industry": reported_industry,
         "callback_url": DETECT_CALLBACK_URL,
     }
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -253,32 +278,58 @@ def post_query_telecom_fraud_result(session_id: str, timeout_sec: float = 300.0)
     raise ValueError(f"响应中未找到风险字段：{raw[:500]}")
 
 
-def read_urls_from_single_column_file(file_path: str) -> list[str]:
+def read_detect_items_from_file(file_path: str) -> list[dict]:
     """
-    从单列表格读取 URL。
-    支持 .csv/.txt/.xlsx（.txt 为每行一个 URL，其余读取第一列）。
+    读取批量提交数据。
+    - 兼容旧格式：单列 URL（.txt/.csv/.xlsx）
+    - 新格式（.csv/.xlsx）：表头包含 url，且可选 text、reported_industry
+    返回: [{"url": "...", "text": "...", "reported_industry": "..."}]
     """
     ext = os.path.splitext(file_path)[1].lower()
-    urls: list[str] = []
+    items: list[dict] = []
 
     if ext == ".txt":
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
                 val = line.strip()
                 if val:
-                    urls.append(val)
+                    items.append({"url": val, "text": "", "reported_industry": ""})
     elif ext == ".csv":
+        parsed_with_header = False
         with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if not row:
-                    continue
-                val = str(row[0]).strip()
-                # 跳过常见表头
-                if val.lower() in {"url", "audio_url"}:
-                    continue
-                if val:
-                    urls.append(val)
+            reader = csv.DictReader(f)
+            if reader.fieldnames:
+                normalized = {str(n).strip().lower(): n for n in reader.fieldnames if n is not None}
+                url_key = normalized.get("url") or normalized.get("audio_url")
+                if url_key:
+                    parsed_with_header = True
+                    text_key = normalized.get("text") or normalized.get("话术")
+                    industry_key = normalized.get("reported_industry") or normalized.get("上报行业")
+                    for item in reader:
+                        url = str(item.get(url_key, "")).strip()
+                        text = str(item.get(text_key, "")).strip() if text_key else ""
+                        reported_industry = str(item.get(industry_key, "")).strip() if industry_key else ""
+                        if not url and not text and not reported_industry:
+                            continue
+                        items.append(
+                            {
+                                "url": url,
+                                "text": text,
+                                "reported_industry": reported_industry,
+                            }
+                        )
+        if not parsed_with_header:
+            with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if not row:
+                        continue
+                    val = str(row[0]).strip()
+                    # 跳过常见表头
+                    if val.lower() in {"url", "audio_url"}:
+                        continue
+                    if val:
+                        items.append({"url": val, "text": "", "reported_industry": ""})
     elif ext == ".xlsx":
         try:
             from openpyxl import load_workbook  # type: ignore[reportMissingImports]
@@ -290,23 +341,52 @@ def read_urls_from_single_column_file(file_path: str) -> list[str]:
         wb = load_workbook(file_path, read_only=True, data_only=True)
         try:
             ws = wb.active
-            for row in ws.iter_rows(min_col=1, max_col=1, values_only=True):
-                cell = row[0]
-                if cell is None:
-                    continue
-                val = str(cell).strip()
-                if val.lower() in {"url", "audio_url"}:
-                    continue
-                if val:
-                    urls.append(val)
+            header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+            header_norm = [str(h).strip().lower() if h is not None else "" for h in (header or ())]
+            if "url" in header_norm or "audio_url" in header_norm:
+                url_idx = header_norm.index("url") if "url" in header_norm else header_norm.index("audio_url")
+                text_idx = header_norm.index("text") if "text" in header_norm else -1
+                reported_industry_idx = (
+                    header_norm.index("reported_industry") if "reported_industry" in header_norm else -1
+                )
+                max_col = max(url_idx, text_idx, reported_industry_idx) + 1
+                for row in ws.iter_rows(min_row=2, max_col=max_col, values_only=True):
+                    url = str(row[url_idx]).strip() if url_idx < len(row) and row[url_idx] is not None else ""
+                    text = str(row[text_idx]).strip() if text_idx >= 0 and text_idx < len(row) and row[text_idx] is not None else ""
+                    reported_industry = (
+                        str(row[reported_industry_idx]).strip()
+                        if reported_industry_idx >= 0
+                        and reported_industry_idx < len(row)
+                        and row[reported_industry_idx] is not None
+                        else ""
+                    )
+                    if not url and not text and not reported_industry:
+                        continue
+                    items.append(
+                        {
+                            "url": url,
+                            "text": text,
+                            "reported_industry": reported_industry,
+                        }
+                    )
+            else:
+                for row in ws.iter_rows(min_col=1, max_col=1, values_only=True):
+                    cell = row[0]
+                    if cell is None:
+                        continue
+                    val = str(cell).strip()
+                    if val.lower() in {"url", "audio_url"}:
+                        continue
+                    if val:
+                        items.append({"url": val, "text": "", "reported_industry": ""})
         finally:
             wb.close()
     else:
-        raise ValueError("仅支持 .csv/.txt/.xlsx 文件（单列 URL）。")
+        raise ValueError("仅支持 .csv/.txt/.xlsx 文件（需含 url 列，text/reported_industry 可选）。")
 
-    if not urls:
-        raise ValueError("文件中未读取到 URL，请检查是否为单列且有内容。")
-    return urls
+    if not items:
+        raise ValueError("文件中未读取到有效数据，请检查 url 列内容。")
+    return items
 
 
 def export_url_session_map(rows: list[dict], save_path: str) -> None:
@@ -314,12 +394,17 @@ def export_url_session_map(rows: list[dict], save_path: str) -> None:
     导出批量结果到本地 CSV。
     """
     with open(save_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["url", "session_id", "error"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["url", "text", "reported_industry", "session_id", "error"],
+        )
         writer.writeheader()
         for row in rows:
             writer.writerow(
                 {
                     "url": row.get("url", ""),
+                    "text": row.get("text", ""),
+                    "reported_industry": row.get("reported_industry", ""),
                     "session_id": row.get("session_id", ""),
                     "error": row.get("error", ""),
                 }
@@ -393,22 +478,13 @@ def export_batch_query_rows(rows: list[dict], save_path: str) -> None:
     """
     导出批量查询结果到本地 CSV。
     """
-    fieldnames = [
-        "url",
-        "session_id",
-        "industry",
-        "reason",
-        "risk_confidence",
-        "risk_severity",
-        "exist_risk",
-        "asr_text",
-        "error",
-    ]
+    english_fields = [key for key, _ in BATCH_QUERY_EXPORT_COLUMNS]
+    chinese_headers = [title for _, title in BATCH_QUERY_EXPORT_COLUMNS]
     with open(save_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        writer = csv.writer(f)
+        writer.writerow(chinese_headers)
         for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fieldnames})
+            writer.writerow([row.get(k, "") for k in english_fields])
 
 
 class DetectWorker(QObject):
@@ -417,13 +493,19 @@ class DetectWorker(QObject):
     finished_ok = Signal(str)
     finished_err = Signal(str)
 
-    def __init__(self, audio_url: str) -> None:
+    def __init__(self, audio_url: str, text: str = "", reported_industry: str = "") -> None:
         super().__init__()
         self._audio_url = audio_url
+        self._text = text
+        self._reported_industry = reported_industry
 
     def run(self) -> None:
         try:
-            session_id = post_detect_telecom_fraud(self._audio_url)
+            session_id = post_detect_telecom_fraud(
+                self._audio_url,
+                text=self._text,
+                reported_industry=self._reported_industry,
+            )
             self.finished_ok.emit(session_id)
         except Exception as e:
             self.finished_err.emit(str(e))
@@ -454,24 +536,51 @@ class BatchDetectWorker(QObject):
     finished_err = Signal(str)
     progress_changed = Signal(int, int)
 
-    def __init__(self, urls: list[str]) -> None:
+    def __init__(self, items: list[dict]) -> None:
         super().__init__()
-        self._urls = urls
+        self._items = items
 
     def run(self) -> None:
         rows: list[dict] = []
         try:
-            total = len(self._urls)
-            for idx, url in enumerate(self._urls, start=1):
+            total = len(self._items)
+            for idx, item in enumerate(self._items, start=1):
+                url = str(item.get("url", "")).strip()
+                text = str(item.get("text", "")).strip()
+                reported_industry = str(item.get("reported_industry", "")).strip()
                 if not is_valid_http_url(url):
-                    rows.append({"url": url, "session_id": "", "error": "URL 格式无效"})
+                    rows.append(
+                        {
+                            "url": url,
+                            "text": text,
+                            "reported_industry": reported_industry,
+                            "session_id": "",
+                            "error": "URL 格式无效",
+                        }
+                    )
                     self.progress_changed.emit(idx, total)
                     continue
                 try:
-                    session_id = post_detect_telecom_fraud(url)
-                    rows.append({"url": url, "session_id": session_id, "error": ""})
+                    session_id = post_detect_telecom_fraud(url, text=text, reported_industry=reported_industry)
+                    rows.append(
+                        {
+                            "url": url,
+                            "text": text,
+                            "reported_industry": reported_industry,
+                            "session_id": session_id,
+                            "error": "",
+                        }
+                    )
                 except Exception as e:
-                    rows.append({"url": url, "session_id": "", "error": str(e)})
+                    rows.append(
+                        {
+                            "url": url,
+                            "text": text,
+                            "reported_industry": reported_industry,
+                            "session_id": "",
+                            "error": str(e),
+                        }
+                    )
                 self.progress_changed.emit(idx, total)
             self.finished_ok.emit(rows)
         except Exception as e:
@@ -500,11 +609,17 @@ class BatchQueryWorker(QObject):
                     "url": url,
                     "session_id": session_id,
                     "industry": "",
+                    "industry_consistent": "",
                     "reason": "",
                     "risk_confidence": "",
                     "risk_severity": "",
                     "exist_risk": "",
                     "asr_text": "",
+                    "agent_attitude": "",
+                    "agent_attitude_score": "",
+                    "agent_attitude_reason": "",
+                    "user_politeness_score": "",
+                    "user_politeness_reason": "",
                     "error": "",
                 }
                 if not session_id:
@@ -515,11 +630,18 @@ class BatchQueryWorker(QObject):
                 try:
                     result = post_query_telecom_fraud_result(session_id)
                     row["industry"] = result.get("industry", "")
+                    ic = result.get("industry_consistent")
+                    row["industry_consistent"] = "" if ic is None else str(ic)
                     row["reason"] = result.get("reason", "")
                     row["risk_confidence"] = result.get("risk_confidence", "")
                     row["risk_severity"] = result.get("risk_severity", "")
                     row["exist_risk"] = result.get("exist_risk", "")
                     row["asr_text"] = result.get("asr_text", "")
+                    row["agent_attitude"] = result.get("agent_attitude", "")
+                    row["agent_attitude_score"] = result.get("agent_attitude_score", "")
+                    row["agent_attitude_reason"] = result.get("agent_attitude_reason", "")
+                    row["user_politeness_score"] = result.get("user_politeness_score", "")
+                    row["user_politeness_reason"] = result.get("user_politeness_reason", "")
                 except Exception as e:
                     row["error"] = str(e)
                 rows.append(row)
@@ -569,6 +691,20 @@ class MainWindow(QWidget):
         self.url_edit.returnPressed.connect(self.on_query_auto)
         layout.addWidget(self.url_edit)
 
+        self.text_label = QLabel("请输入话术（text，可选）：")
+        layout.addWidget(self.text_label)
+        self.text_edit = QLineEdit()
+        self.text_edit.setPlaceholderText("可选：若填写将优先用于风险识别")
+        self.text_edit.returnPressed.connect(self.on_query_auto)
+        layout.addWidget(self.text_edit)
+
+        self.reported_industry_label = QLabel("请输入上报行业（reported_industry，可选）：")
+        layout.addWidget(self.reported_industry_label)
+        self.reported_industry_edit = QLineEdit()
+        self.reported_industry_edit.setPlaceholderText("可选：如 金融业-银行贷款")
+        self.reported_industry_edit.returnPressed.connect(self.on_query_auto)
+        layout.addWidget(self.reported_industry_edit)
+
         self.session_id_label = QLabel("请输入 session_id：")
         layout.addWidget(self.session_id_label)
         self.session_id_edit = QLineEdit()
@@ -576,7 +712,9 @@ class MainWindow(QWidget):
         self.session_id_edit.returnPressed.connect(self.on_query_auto)
         layout.addWidget(self.session_id_edit)
 
-        self.detect_section_label = QLabel("批量提交（单列 URL，支持 .csv/.txt/.xlsx）：")
+        self.detect_section_label = QLabel(
+            "批量提交（支持 .csv/.txt/.xlsx；.csv/.xlsx 可含 url、text、reported_industry）："
+        )
         layout.addWidget(self.detect_section_label)
         detect_file_row = QHBoxLayout()
         self.batch_detect_file_edit = QLineEdit()
@@ -640,6 +778,8 @@ class MainWindow(QWidget):
         self.btn_pick_query_file.setEnabled(not busy)
         self.mode_tabs.setEnabled(not busy)
         self.url_edit.setEnabled(not busy)
+        self.text_edit.setEnabled(not busy)
+        self.reported_industry_edit.setEnabled(not busy)
         self.session_id_edit.setEnabled(not busy)
 
     def _set_widgets_visible(self, widgets: list[QWidget], visible: bool) -> None:
@@ -652,6 +792,10 @@ class MainWindow(QWidget):
 
         self.url_label.setVisible(is_single_mode)
         self.url_edit.setVisible(is_single_mode)
+        self.text_label.setVisible(is_single_mode)
+        self.text_edit.setVisible(is_single_mode)
+        self.reported_industry_label.setVisible(is_single_mode)
+        self.reported_industry_edit.setVisible(is_single_mode)
         self.session_id_label.setVisible(is_single_mode)
         self.session_id_edit.setVisible(is_single_mode)
 
@@ -790,6 +934,8 @@ class MainWindow(QWidget):
         if self._thread is not None:
             return
         url = self.url_edit.text().strip()
+        text = self.text_edit.text().strip()
+        reported_industry = self.reported_industry_edit.text().strip()
         if not is_valid_http_url(url):
             QMessageBox.warning(
                 self,
@@ -800,7 +946,7 @@ class MainWindow(QWidget):
 
         self._set_busy(True)
         self._thread = QThread()
-        self._worker = DetectWorker(url)
+        self._worker = DetectWorker(url, text=text, reported_industry=reported_industry)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished_ok.connect(self._on_detect_ok)
@@ -810,13 +956,21 @@ class MainWindow(QWidget):
     def _on_query_ok(self, result: dict) -> None:
         self._set_busy(False)
         self._cleanup_thread()
+        _ic = result.get("industry_consistent")
+        _ic_s = "" if _ic is None else str(_ic)
         message = (
             f"industry: {result.get('industry', '')}\n"
+            f"行业分类是否一致 (industry_consistent): {_ic_s}\n"
             f"reason: {result.get('reason', '')}\n"
             f"risk_confidence: {result.get('risk_confidence', '')}\n"
             f"risk_severity: {result.get('risk_severity', '')}\n"
             f"exist_risk: {result.get('exist_risk', '')}\n"
-            f"asr_text: {result.get('asr_text', '')}"
+            f"asr_text: {result.get('asr_text', '')}\n"
+            f"客服态度 (agent_attitude): {result.get('agent_attitude', '')}\n"
+            f"客服态度得分 (agent_attitude_score): {result.get('agent_attitude_score', '')}\n"
+            f"客服态度原因 (agent_attitude_reason): {result.get('agent_attitude_reason', '')}\n"
+            f"用户礼貌得分 (user_politeness_score): {result.get('user_politeness_score', '')}\n"
+            f"用户礼貌原因 (user_politeness_reason): {result.get('user_politeness_reason', '')}"
         )
         QMessageBox.information(self, "查询结果", message)
 
@@ -840,7 +994,7 @@ class MainWindow(QWidget):
     def on_pick_detect_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择单列 URL 文件",
+            "选择批量提交文件",
             "",
             "URL Files (*.csv *.txt *.xlsx)",
         )
@@ -869,7 +1023,7 @@ class MainWindow(QWidget):
             return
 
         try:
-            urls = read_urls_from_single_column_file(file_path)
+            items = read_detect_items_from_file(file_path)
         except Exception as e:
             QMessageBox.critical(self, "文件读取失败", str(e))
             return
@@ -877,7 +1031,7 @@ class MainWindow(QWidget):
         self._set_busy(True)
         self._reset_detect_progress()
         self._thread = QThread()
-        self._worker = BatchDetectWorker(urls)
+        self._worker = BatchDetectWorker(items)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress_changed.connect(self._on_batch_detect_progress)
@@ -924,11 +1078,13 @@ class MainWindow(QWidget):
             return
         url = self.url_edit.text().strip()
         session_id = self.session_id_edit.text().strip()
+        if session_id:
+            # 单个查询体验优化：session_id 存在时优先查询结果，
+            # 避免 URL 仍保留时重复触发“提交获取 session_id”。
+            self.on_query_confirm()
+            return
         if url:
             self.on_confirm()
-            return
-        if session_id:
-            self.on_query_confirm()
             return
         QMessageBox.warning(self, "输入无效", "请先输入 URL，或输入 session_id。")
 
@@ -959,6 +1115,8 @@ class MainWindow(QWidget):
 
         if self.mode_tabs.currentIndex() == 0:
             self.url_edit.clear()
+            self.text_edit.clear()
+            self.reported_industry_edit.clear()
             self.session_id_edit.clear()
             self.url_edit.setFocus(Qt.FocusReason.OtherFocusReason)
             return
